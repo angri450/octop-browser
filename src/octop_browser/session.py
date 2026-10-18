@@ -12,7 +12,7 @@ import aiohttp
 
 from octop_browser.actions import capture, interact, js_eval
 from octop_browser.actions import navigate as nav_actions
-from octop_browser.cdp.client import CDPClient
+from octop_browser.cdp.client import CDPClient, CDPSessionError
 from octop_browser.cdp.launcher import get_page_ws_url, launch_or_attach
 from octop_browser.dom.builder import DOMBuilder, DOMLevel
 from octop_browser.dom.refs import RefCache
@@ -71,6 +71,13 @@ class _InternalCDPSession:
         # Note: the "Input" domain has no .enable method in CDP — input events
         # are dispatched directly via Input.dispatch* commands without enabling.
         await self._apply_viewport()
+        # Persist the attached target so cross-process callers (CLI, replay)
+        # re-attach to the same tab instead of guessing. The launcher path
+        # already saves it inside get_page_ws_url; direct CDP mode had no
+        # equivalent, leaving _current_target_id() (and therefore list_tabs'
+        # active marker) empty for the whole session.
+        if self._client.current_target_id:
+            self._profile.save_target(self._client.current_target_id)
         self._connected = True
         if self._idle_controller is not None:
             self._idle_controller.start()
@@ -627,10 +634,7 @@ class BrowserSession(HooksMixin):
             else:
                 previous_target_id = self._current_target_id()
                 create_url = url or "about:blank"
-                cdp_result = await self._internal.client.send(
-                    "Target.createTarget", {"url": create_url}
-                )
-                target_id = str(cdp_result.get("targetId", ""))
+                target_id = await self._create_or_reuse_target(create_url)
                 if target_id:
                     await self._switch_to_target_with_retry(target_id)
                 if not url:
@@ -690,6 +694,55 @@ class BrowserSession(HooksMixin):
             self._internal.ref_cache,
             url,
         )
+
+    async def _create_or_reuse_target(self, url: str) -> str:
+        """Create a page target for *url*, reusing an existing one when the
+        browser reports the URL is already loaded.
+
+        Chrome's ``Target.createTarget`` answers a duplicate URL with the
+        existing target id; Lightpanda (a single-tab browser) rejects every
+        second createTarget with ``TargetAlreadyLoaded`` instead. Normalize
+        both into a target id we can attach to; re-raise when the error means
+        something else or no matching target exists.
+        """
+        try:
+            cdp_result = await self._internal.client.send(
+                "Target.createTarget", {"url": url}
+            )
+            target_id = str(cdp_result.get("targetId", ""))
+            if not target_id:
+                raise CDPSessionError("Target.createTarget returned no targetId")
+            return target_id
+        except CDPSessionError as exc:
+            if "TargetAlreadyLoaded" not in str(exc):
+                raise
+            existing = await self._find_target_by_url(url)
+            if existing is None:
+                raise
+            logger.debug(
+                "Reusing target %s for %s (browser reported TargetAlreadyLoaded)",
+                existing,
+                url,
+            )
+            return existing
+
+    async def _find_target_by_url(self, url: str) -> str | None:
+        """Return the id of a page target showing *url*, if any.
+
+        Tolerates a trailing-slash mismatch — Chrome's ``Target.getTargets``
+        normalizes ``https://example.com`` to ``https://example.com/``.
+        """
+        result = await self._internal.client.send("Target.getTargets")
+        candidates = {url, url.rstrip("/"), f"{url.rstrip('/')}/"}
+        for target in result.get("targetInfos", []):
+            if not isinstance(target, dict) or target.get("type") != "page":
+                continue
+            if target.get("url") not in candidates:
+                continue
+            target_id = target.get("targetId")
+            if isinstance(target_id, str) and target_id:
+                return target_id
+        return None
 
     async def _close_failed_new_target(
         self, target_id: str, previous_target_id: str | None

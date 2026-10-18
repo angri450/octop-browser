@@ -72,6 +72,7 @@ class CDPClient:
         self._recv_task: asyncio.Task[None] | None = None
         self._id = 0
         self._session_id: str | None = None
+        self._current_target_id: str | None = None
         self._browser_level = False
 
     @property
@@ -84,7 +85,12 @@ class CDPClient:
         """Session id stamped on outgoing commands, if any."""
         return self._session_id
 
-    async def connect(self, ws_url: str) -> None:
+    @property
+    def current_target_id(self) -> str | None:
+        """Target id of the attached page session, if any."""
+        return self._current_target_id
+
+    async def connect(self, ws_url: str, target_id: str | None = None) -> None:
         """Connect to a CDP WebSocket endpoint.
 
         ``websockets`` defaults to a 1 MiB receive frame cap; CDP responses
@@ -100,6 +106,13 @@ class CDPClient:
         (Chrome rejects them; Lightpanda answers
         ``BrowserContextNotLoaded``), which made ``BROWSER_USE_CDP_WS_URL``
         unusable against such servers.
+
+        Args:
+            ws_url: Endpoint to dial.
+            target_id: Browser-level endpoints only — attach to this page
+                target instead of picking/creating one. Callers that manage
+                several pages over one socket (the recorder) pass it
+                explicitly.
         """
         ws = await websockets.connect(
             ws_url,
@@ -114,7 +127,7 @@ class CDPClient:
             return
         self._browser_level = True
         try:
-            await self.attach_page_session()
+            await self.attach_page_session(target_id)
         except CDPSessionError as exc:
             await self.close()
             raise CDPSessionError(
@@ -147,6 +160,7 @@ class CDPClient:
                 f"Target.attachToTarget returned no session id for target {target_id}"
             )
         self._session_id = session_id
+        self._current_target_id = target_id
         return session_id
 
     async def _pick_page_target(self) -> str:
@@ -272,6 +286,7 @@ class CDPClient:
             except asyncio.CancelledError:
                 pass
         self._session_id = None
+        self._current_target_id = None
         self._browser_level = False
         logger.debug("CDP connection closed")
 
