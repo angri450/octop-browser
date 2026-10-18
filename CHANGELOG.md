@@ -14,6 +14,16 @@
 
 ### 变更
 
+- 修复直连 CDP 模式（`BROWSER_USE_CDP_WS_URL`）：browser 级端点现在会在连接时
+  自动 `Target.attachToTarget` 建立页面会话，页面域命令携带 sessionId；此前直连
+  标准 CDP 服务器（如 Lightpanda）会在 `Runtime.enable` 阶段报
+  `BrowserContextNotLoaded`，该模式实际不可用。标签页管理（新建/切换/关闭/列举）
+  改走 CDP `Target.*` 命令，不再依赖 Chrome 专有的 HTTP `/json` 端点；直连模式下
+  `close_session(kill=True)` 不再静默无操作（记录日志说明不终止远程浏览器）；
+  viewport 设置失败时记录 warning 而非静默。README 补充两种端点形态的用法与直连
+  模式的能力边界，新增 mock CDP server 单元测试覆盖上述行为。
+- 修正 `mcp` 依赖上限：`<3` 改回 `<2`，与注释及运行时要求一致（mcp 2.x 删除了
+  `mcp_server.py` 依赖的低层 `Server.list_tools` / `Server.call_tool` API）。
 - 对齐 Octop：引入 `develop` 集成分支策略；禁止直推 `main`/`develop`；发版后由 `sync-main-to-develop.yml` 同步；新增 `/publish` skill（发版同步 CHANGELOG / README）。
 
 
