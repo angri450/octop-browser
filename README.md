@@ -383,6 +383,12 @@ Both shapes support the full action set. Known limitations of direct mode:
   domain cannot list or switch tabs.
 - Idle reaping (`BROWSER_USE_IDLE_TIMEOUT_MINUTES`) covers locally launched
   Chrome only and is inactive in direct mode.
+- Single-tab, single-session servers (Lightpanda): `new_tab` reuses the
+  existing target when the URL matches and fails when it does not; targets
+  are dropped when the last connection closes, so cross-process target
+  stickiness does not apply; and because page events reach only the
+  connection that issued the command, the recorder cannot observe actions
+  driven from a second connection against such a server.
 
 ## 🛠️ Development
 

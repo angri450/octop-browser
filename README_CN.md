@@ -374,6 +374,10 @@ session = await BrowserSession.create(profile="remote", settings=settings)
   `Target.*` 命令。未实现 Target 域的浏览器无法列举或切换标签页。
 - 空闲回收（`BROWSER_USE_IDLE_TIMEOUT_MINUTES`）只对本地启动的 Chrome 生效，
   直连模式下不启用。
+- 单标签、单会话的服务器（如 Lightpanda）：`new_tab` 在 URL 相当时复用既有
+  标签，不同 URL 时失败；全部连接断开后标签即回收，跨进程的标签粘性不适用；
+  页面事件只推送给发出命令的连接，因此 recorder 无法通过第二个连接观测
+  这类服务器上的操作。
 
 ## 🛠️ 开发
 
