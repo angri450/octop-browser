@@ -15,6 +15,7 @@ Covers the direct-connect defects found while driving Lightpanda
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from typing import Any
@@ -22,6 +23,7 @@ from typing import Any
 import pytest
 from websockets.asyncio.server import Server, serve
 
+from octop_browser.cdp.client import CDPClient
 from octop_browser.profile import ProfileManager
 from octop_browser.session import BrowserSession
 from octop_browser.settings import OctopSettings
@@ -56,6 +58,7 @@ class FakeCDPServer:
         self.viewport: dict[str, Any] | None = None
         self.fail_viewport = False
         self.require_session = True
+        self.create_target_already_loaded = False
         self._server: Server | None = None
         self.port = 0
 
@@ -87,6 +90,9 @@ class FakeCDPServer:
         if method == "Target.getTargets":
             await self._reply(ws, msg_id, {"targetInfos": self.targets})
         elif method == "Target.createTarget":
+            if self.create_target_already_loaded:
+                await self._error(ws, msg_id, "TargetAlreadyLoaded")
+                return
             target_id = f"NEW-{len(self.targets) + 1}"
             self.targets.append(
                 {
@@ -366,5 +372,189 @@ async def test_close_tab_removes_target(cdp_server, tmp_path):
         ][-1]
         assert close_msg["params"]["targetId"] == "TAB-9"
         assert [t["targetId"] for t in cdp_server.targets] == ["TAB-1"]
+    finally:
+        await sess.close()
+
+
+# ----------------------------------------------------------------------
+# Second batch: target persistence, explicit-target attach, recorder
+# ----------------------------------------------------------------------
+
+
+async def test_connect_persists_target_for_cross_process_reuse(cdp_server, tmp_path):
+    """Direct mode used to skip profile.save_target, leaving
+    _current_target_id() (and list_tabs' active marker) empty."""
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        target_file = sess._internal._profile.data_dir / ".octop-browser-target.json"
+        assert target_file.is_file()
+        assert json.loads(target_file.read_text())["target_id"] == "TAB-1"
+        assert sess._current_target_id() == "TAB-1"
+    finally:
+        await sess.close()
+
+
+async def test_list_tabs_marks_persisted_target_active(cdp_server, tmp_path):
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        result = await sess.list_tabs()
+        tabs = result.metadata["tabs"]  # type: ignore[index]
+        assert tabs[0]["active"] is True
+        assert tabs[0]["tab_id"] == "TAB-1"
+    finally:
+        await sess.close()
+
+
+async def test_connect_with_explicit_target_id(cdp_server):
+    """Recorder-style usage: attach to a named target, not the preferred one."""
+    client = CDPClient()
+    await client.connect(cdp_server.ws_url(), target_id="TAB-9")
+    try:
+        assert cdp_server.attached[-1]["targetId"] == "TAB-9"
+        assert client.current_target_id == "TAB-9"
+        assert client.session_id == "SID-1"
+        await client.enable_domain("Page")
+        assert cdp_server.received[-1].get("sessionId") == "SID-1"
+    finally:
+        await client.close()
+
+
+async def test_recorder_direct_mode_discovers_new_tab(cdp_server, tmp_path):
+    """A tab opened after recording starts is discovered over CDP
+    (Target.getTargets) and gets its own client plus a page_opened event.
+    Before the fix, direct mode relied on Chrome-only HTTP /json and never
+    saw new tabs."""
+    from datetime import datetime, timezone
+
+    from octop_browser.record.models import (
+        PrivacySettings,
+        RecordingManifest,
+        RecordingTarget,
+    )
+    from octop_browser.record.recorder import RecordSession
+    from octop_browser.record.settings import RecordReplaySettings
+    from octop_browser.record.store import RecordingStore
+
+    store = RecordingStore(RecordReplaySettings(base_dir=tmp_path / "rec"))
+    manifest = RecordingManifest(
+        recording_id="rec_test",
+        created_at=datetime.now(timezone.utc).isoformat(),
+        profile="direct",
+        target=RecordingTarget(start_url="https://example.com"),
+        privacy=PrivacySettings(),
+    )
+    store.create(manifest)
+    client = CDPClient()
+    await client.connect(cdp_server.ws_url())
+    session = RecordSession(
+        client,
+        store,
+        manifest,
+        cdp_ws_url=cdp_server.ws_url(),
+        initial_target_id=client.current_target_id,
+    )
+    try:
+        await session.start()
+        assert "TAB-1" in session._clients
+        cdp_server.targets.append(
+            {
+                "targetId": "TAB-2",
+                "type": "page",
+                "url": "https://new.example",
+                "title": "New",
+            }
+        )
+        await session._attach_known_targets()
+        assert "TAB-2" in session._clients
+        assert session._client_target_ids[id(session._clients["TAB-2"])] == "TAB-2"
+        assert session._clients["TAB-2"].current_target_id == "TAB-2"
+        events = store.read_events("rec_test")
+        opened = [
+            e
+            for e in events
+            if e.get("kind") == "page_opened" and e.get("targetId") == "TAB-2"
+        ]
+        assert opened and opened[0]["url"] == "https://new.example"
+        # The poll loop keeps running in direct mode now (it used to be
+        # Chrome-only) and must not drop the initial client.
+        await asyncio.sleep(0.1)
+        assert "TAB-1" in session._clients
+    finally:
+        await session.stop(generate_steps=False)
+        await client.close()
+
+
+async def test_close_session_kill_direct_mode_logs(caplog, monkeypatch, tmp_path):
+    """browser_tool close_session kill=True in direct mode: no terminate
+    attempt, and an info log instead of silence."""
+    from octop_browser import tool_interface as ti
+    from octop_browser.settings import settings as live_settings
+
+    terminated: list[Any] = []
+
+    async def fake_terminate(*args: Any, **kwargs: Any) -> bool:
+        terminated.append(True)
+        return True
+
+    monkeypatch.setattr("octop_browser.cdp.launcher.terminate_browser", fake_terminate)
+    monkeypatch.setattr(live_settings, "cdp_ws_url", "ws://127.0.0.1:9222/")
+    monkeypatch.setattr(live_settings, "profiles_dir", tmp_path / "profiles")
+    with caplog.at_level(logging.INFO, logger="octop_browser.tool_interface"):
+        result = await ti.browser_tool(
+            action="close_session", profile="never-created", kill=True
+        )
+    assert result.success is True
+    assert terminated == []
+    assert any("direct CDP mode" in r.message for r in caplog.records)
+
+
+# ----------------------------------------------------------------------
+# Third batch: single-tab browsers (Lightpanda rejects the second
+# Target.createTarget with TargetAlreadyLoaded)
+# ----------------------------------------------------------------------
+
+
+async def test_new_tab_reuses_target_when_already_loaded(cdp_server, tmp_path):
+    """Lightpanda-style servers reject the second createTarget; new_tab
+    falls back to the existing target showing the same URL."""
+    cdp_server.create_target_already_loaded = True
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        result = await sess.new_tab("https://example.com", force_new=True)
+        assert result.success is True
+        assert result.content == "TAB-1"
+        assert result.metadata == {"target_id": "TAB-1"}
+        create_msgs = [
+            m for m in cdp_server.received if m["method"] == "Target.createTarget"
+        ]
+        assert len(create_msgs) == 1
+        assert cdp_server.attached[-1]["targetId"] == "TAB-1"
+        assert sess._internal.client.current_target_id == "TAB-1"
+    finally:
+        await sess.close()
+
+
+async def test_new_tab_already_loaded_without_match_still_fails(cdp_server, tmp_path):
+    """TargetAlreadyLoaded with no same-URL target is a real failure."""
+    cdp_server.create_target_already_loaded = True
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        result = await sess.new_tab("https://nowhere.example", force_new=True)
+        assert result.success is False
+        assert "TargetAlreadyLoaded" in str(result.error)
+    finally:
+        await sess.close()
+
+
+async def test_new_tab_already_loaded_tolerates_trailing_slash(cdp_server, tmp_path):
+    """Chrome normalizes URLs with a trailing slash in Target.getTargets;
+    the reuse lookup must not miss that match."""
+    cdp_server.create_target_already_loaded = True
+    cdp_server.targets[0]["url"] = "https://example.com/"
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        result = await sess.new_tab("https://example.com", force_new=True)
+        assert result.success is True
+        assert result.content == "TAB-1"
     finally:
         await sess.close()
