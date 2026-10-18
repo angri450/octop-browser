@@ -51,6 +51,12 @@ class _InternalCDPSession:
 
         If ``BROWSER_USE_CDP_WS_URL`` is set (or ``cfg.cdp_ws_url`` is provided),
         skip the launcher and connect directly to that WebSocket address.
+
+        Endpoint shape is handled by :meth:`CDPClient.connect`: page-level
+        URLs (``/devtools/page/<id>``) bind the socket to one page, while
+        browser-level URLs (Chrome's ``/devtools/browser/<id>`` and
+        single-endpoint servers such as Lightpanda) are attached to a page
+        target automatically, so page-domain commands are valid either way.
         """
         if self._cfg.cdp_ws_url:
             ws_url = self._cfg.cdp_ws_url
@@ -61,15 +67,23 @@ class _InternalCDPSession:
                 self._profile.cdp_port, profile=self._profile
             )
         await self._client.connect(ws_url)
-        await self._client.enable_domain("Page")
-        await self._client.enable_domain("DOM")
-        await self._client.enable_domain("Runtime")
+        await self._enable_page_domains()
         # Note: the "Input" domain has no .enable method in CDP — input events
         # are dispatched directly via Input.dispatch* commands without enabling.
         await self._apply_viewport()
         self._connected = True
         if self._idle_controller is not None:
             self._idle_controller.start()
+
+    async def _enable_page_domains(self) -> None:
+        """Enable the page domains every action depends on.
+
+        Must be re-run after every session switch: a fresh
+        ``Target.attachToTarget`` session starts with all domains disabled.
+        """
+        await self._client.enable_domain("Page")
+        await self._client.enable_domain("DOM")
+        await self._client.enable_domain("Runtime")
 
     async def _apply_viewport(self) -> None:
         """Pin the page viewport to the configured CSS-pixel dimensions.
@@ -92,8 +106,13 @@ class _InternalCDPSession:
                     "mobile": False,
                 },
             )
-        except Exception:  # pragma: no cover  # pylint: disable=broad-except
-            logger.debug("setDeviceMetricsOverride failed", exc_info=True)
+        except Exception:  # pylint: disable=broad-except
+            logger.warning(
+                "Emulation.setDeviceMetricsOverride failed; screenshots will "
+                "use the browser default viewport instead of %dx%d",
+                width,
+                height,
+            )
 
     async def switch_to_target(self, target_id: str, *, activate: bool = True) -> None:
         """Reconnect this session to another page target.
@@ -101,13 +120,17 @@ class _InternalCDPSession:
         ``Target.activateTarget`` alone only focuses the Chrome tab; a CDP
         WebSocket remains bound to the old page. CLI calls and replay both
         expect subsequent actions after ``new_tab`` / ``switch_tab`` to address
-        the selected tab, so we reconnect the page-level CDP client and persist
-        the chosen target id on the profile.
+        the selected tab, so the session is re-pointed at *target_id* and the
+        chosen id is persisted on the profile.
+
+        Browser-level endpoints (direct CDP connections such as
+        ``BROWSER_USE_CDP_WS_URL``) re-attach over the same socket via
+        ``Target.attachToTarget`` — no reconnect and no HTTP ``/json``
+        lookup, which single-endpoint servers like Lightpanda do not serve.
+        Page-level endpoints keep the original reconnect path: the socket
+        itself is page-bound, so the target's own debug URL must be fetched
+        from ``/json`` and dialed.
         """
-        if self._cfg.cdp_ws_url:
-            raise RuntimeError(
-                "Cannot switch tabs when connected via BROWSER_USE_CDP_WS_URL"
-            )
         if activate:
             try:
                 await self._client.send(
@@ -115,6 +138,13 @@ class _InternalCDPSession:
                 )
             except Exception:  # pragma: no cover  # pylint: disable=broad-except
                 logger.debug("Target.activateTarget failed", exc_info=True)
+
+        if self._client.is_browser_level:
+            await self._client.attach_page_session(target_id)
+            await self._enable_page_domains()
+            await self._apply_viewport()
+            self._profile.save_target(target_id)
+            return
 
         import aiohttp
 
@@ -140,9 +170,7 @@ class _InternalCDPSession:
         )
         self._ref_cache.invalidate()
         await self._client.connect(str(match["webSocketDebuggerUrl"]))
-        await self._client.enable_domain("Page")
-        await self._client.enable_domain("DOM")
-        await self._client.enable_domain("Runtime")
+        await self._enable_page_domains()
         await self._apply_viewport()
         self._profile.save_target(target_id)
 
@@ -152,7 +180,15 @@ class _InternalCDPSession:
         if kill:
             if self._idle_controller is not None:
                 await self._idle_controller.reap_now()
-            elif not self._cfg.cdp_ws_url:
+            elif self._cfg.cdp_ws_url:
+                # Direct CDP mode serves a browser this process does not own
+                # (remote host, container, Lightpanda, …); terminating it
+                # would be an unexpected side effect for the caller.
+                logger.info(
+                    "kill=True ignored in direct CDP mode "
+                    "(BROWSER_USE_CDP_WS_URL); the remote browser keeps running"
+                )
+            else:
                 from octop_browser.cdp.launcher import (  # noqa: PLC0415
                     terminate_browser,
                 )
@@ -711,12 +747,24 @@ class BrowserSession(HooksMixin):
             raise last_exc
 
     async def _find_blank_target_id(self) -> str | None:
-        if self._internal._cfg.cdp_ws_url:
+        current_target_id = self._current_target_id()
+        client = self._internal.client
+        if client.is_browser_level:
+            # CDP-native listing: HTTP /json is a Chrome-only endpoint that
+            # single-endpoint servers (Lightpanda) do not serve.
+            result = await client.send("Target.getTargets")
+            for target in result.get("targetInfos", []):
+                if not isinstance(target, dict) or target.get("type") != "page":
+                    continue
+                target_id = target.get("targetId")
+                if not isinstance(target_id, str) or target_id == current_target_id:
+                    continue
+                if target.get("url") in _REUSABLE_BLANK_URLS:
+                    return target_id
             return None
 
         host = self._internal._cfg.cdp_host
         port = self._internal._profile.cdp_port
-        current_target_id = self._current_target_id()
         async with aiohttp.ClientSession() as http:
             async with http.get(f"http://{host}:{port}/json") as resp:
                 targets = await resp.json(content_type=None)
@@ -802,30 +850,52 @@ class BrowserSession(HooksMixin):
         start = time.monotonic()
         await self._fire("before_action", {"action": "list_tabs", "params": {}})
         try:
-            host = self._internal._cfg.cdp_host
-            port = self._internal._profile.cdp_port
-            async with aiohttp.ClientSession() as http:
-                async with http.get(f"http://{host}:{port}/json") as resp:
-                    targets = await resp.json(content_type=None)
+            client = self._internal.client
             current_target_id = self._current_target_id()
-            page_targets = [
-                t for t in targets if isinstance(t, dict) and t.get("type") == "page"
-            ]
+            if client.is_browser_level:
+                # CDP-native listing: HTTP /json is a Chrome-only endpoint that
+                # single-endpoint servers (Lightpanda) do not serve. CDP
+                # target infos name the id field "targetId" instead of "id".
+                targets_resp = await client.send("Target.getTargets")
+                page_targets = [
+                    t
+                    for t in targets_resp.get("targetInfos", [])
+                    if isinstance(t, dict) and t.get("type") == "page"
+                ]
+                entries = [
+                    (t["targetId"], t.get("url", ""), t.get("title", ""))
+                    for t in page_targets
+                    if isinstance(t.get("targetId"), str)
+                ]
+            else:
+                host = self._internal._cfg.cdp_host
+                port = self._internal._profile.cdp_port
+                async with aiohttp.ClientSession() as http:
+                    async with http.get(f"http://{host}:{port}/json") as resp:
+                        targets = await resp.json(content_type=None)
+                page_targets = [
+                    t
+                    for t in targets
+                    if isinstance(t, dict) and t.get("type") == "page"
+                ]
+                entries = [
+                    (t["id"], t.get("url", ""), t.get("title", ""))
+                    for t in page_targets
+                    if isinstance(t.get("id"), str)
+                ]
             active_id = current_target_id
-            if active_id and not any(t.get("id") == active_id for t in page_targets):
+            if active_id and not any(tab_id == active_id for tab_id, _, _ in entries):
                 active_id = None
-            if active_id is None and page_targets:
-                first_id = page_targets[0].get("id")
-                active_id = first_id if isinstance(first_id, str) else None
+            if active_id is None and entries:
+                active_id = entries[0][0]
             tabs = [
                 TabInfo(
-                    tab_id=t["id"],
-                    url=t.get("url", ""),
-                    title=t.get("title", ""),
-                    active=t.get("id") == active_id,
+                    tab_id=tab_id,
+                    url=url,
+                    title=title,
+                    active=tab_id == active_id,
                 )
-                for t in page_targets
-                if isinstance(t.get("id"), str)
+                for tab_id, url, title in entries
             ]
             content = (
                 "\n".join(
