@@ -1,0 +1,370 @@
+"""Direct CDP mode (BROWSER_USE_CDP_WS_URL) against a mock CDP server.
+
+Covers the direct-connect defects found while driving Lightpanda
+(single-endpoint CDP server, no HTTP /json):
+
+* browser-level endpoints attach a page session automatically — page-domain
+  commands without a session id used to fail with BrowserContextNotLoaded
+* page-level endpoints (Chrome's /devtools/page/<id>) keep the no-session
+  behaviour, so the local-Chrome path does not regress
+* tab switching re-attaches over the same socket via Target.attachToTarget
+  instead of raising or relying on Chrome-only HTTP /json
+* viewport failures warn instead of failing silently
+* close(kill=True) leaves a remote browser running and says so
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any
+
+import pytest
+from websockets.asyncio.server import Server, serve
+
+from octop_browser.profile import ProfileManager
+from octop_browser.session import BrowserSession
+from octop_browser.settings import OctopSettings
+
+
+class FakeCDPServer:
+    """Minimal flatten-mode CDP server speaking real WebSocket.
+
+    ``require_session`` mimics a standard browser-level endpoint: page-domain
+    commands without a session id are rejected (Lightpanda answers
+    BrowserContextNotLoaded, Chrome drops the command). Page-level endpoint
+    tests turn it off.
+    """
+
+    def __init__(self) -> None:
+        self.targets: list[dict[str, Any]] = [
+            {
+                "targetId": "TAB-1",
+                "type": "page",
+                "url": "https://example.com",
+                "title": "Example",
+            },
+            {
+                "targetId": "TAB-9",
+                "type": "page",
+                "url": "about:blank",
+                "title": "",
+            },
+        ]
+        self.attached: list[dict[str, Any]] = []
+        self.received: list[dict[str, Any]] = []
+        self.viewport: dict[str, Any] | None = None
+        self.fail_viewport = False
+        self.require_session = True
+        self._server: Server | None = None
+        self.port = 0
+
+    async def start(self) -> None:
+        self._server = await serve(self._handler, "127.0.0.1", 0)
+        self.port = self._server.sockets[0].getsockname()[1]
+
+    async def stop(self) -> None:
+        assert self._server is not None
+        self._server.close()
+        await self._server.wait_closed()
+
+    def ws_url(self, path: str = "/") -> str:
+        return f"ws://127.0.0.1:{self.port}{path}"
+
+    def methods(self) -> list[str]:
+        return [str(m["method"]) for m in self.received]
+
+    async def _handler(self, ws: Any) -> None:
+        async for raw in ws:
+            msg = json.loads(raw)
+            self.received.append(msg)
+            await self._dispatch(ws, msg)
+
+    async def _dispatch(self, ws: Any, msg: dict[str, Any]) -> None:
+        method = msg["method"]
+        msg_id = msg["id"]
+        params = msg.get("params", {})
+        if method == "Target.getTargets":
+            await self._reply(ws, msg_id, {"targetInfos": self.targets})
+        elif method == "Target.createTarget":
+            target_id = f"NEW-{len(self.targets) + 1}"
+            self.targets.append(
+                {
+                    "targetId": target_id,
+                    "type": "page",
+                    "url": str(params.get("url") or "about:blank"),
+                    "title": "",
+                }
+            )
+            await self._reply(ws, msg_id, {"targetId": target_id})
+        elif method == "Target.attachToTarget":
+            self.attached.append(
+                {
+                    "targetId": params.get("targetId"),
+                    "flatten": params.get("flatten"),
+                    "sessionId": msg.get("sessionId"),
+                }
+            )
+            await self._reply(ws, msg_id, {"sessionId": f"SID-{len(self.attached)}"})
+        elif method == "Target.activateTarget":
+            await self._reply(ws, msg_id, {})
+        elif method == "Target.closeTarget":
+            closed = params.get("targetId")
+            self.targets = [t for t in self.targets if t.get("targetId") != closed]
+            await self._reply(ws, msg_id, {"success": True})
+        elif method in ("Page.enable", "DOM.enable", "Runtime.enable"):
+            if self.require_session and not msg.get("sessionId"):
+                await self._error(ws, msg_id, "missing sessionId on page command")
+                return
+            await self._reply(ws, msg_id, {})
+        elif method == "Emulation.setDeviceMetricsOverride":
+            if self.fail_viewport:
+                await self._error(ws, msg_id, "Emulation domain unavailable")
+                return
+            self.viewport = dict(params)
+            await self._reply(ws, msg_id, {})
+        elif method == "Page.navigate":
+            await self._reply(ws, msg_id, {"frameId": "FRAME-1"})
+            await ws.send(json.dumps({"method": "Page.loadEventFired", "params": {}}))
+        elif method == "Runtime.evaluate":
+            await self._reply(
+                ws,
+                msg_id,
+                {"result": {"type": "string", "value": params.get("expression", "")}},
+            )
+        else:
+            await self._reply(ws, msg_id, {})
+
+    async def _reply(self, ws: Any, msg_id: int, result: dict[str, Any]) -> None:
+        await ws.send(json.dumps({"id": msg_id, "result": result}))
+
+    async def _error(self, ws: Any, msg_id: int, message: str) -> None:
+        await ws.send(
+            json.dumps({"id": msg_id, "error": {"code": -32000, "message": message}})
+        )
+
+
+@pytest.fixture()
+async def cdp_server() -> Any:
+    server = FakeCDPServer()
+    await server.start()
+    try:
+        yield server
+    finally:
+        await server.stop()
+
+
+async def make_session(ws_url: str, tmp_path: Any, **overrides: Any) -> BrowserSession:
+    pm = ProfileManager(base_dir=tmp_path / "profiles")
+    cfg = OctopSettings(cdp_ws_url=ws_url, **overrides)
+    return await BrowserSession.create(
+        profile="direct", profile_manager=pm, settings=cfg
+    )
+
+
+_PAGE_ENABLES = ("Page.enable", "DOM.enable", "Runtime.enable")
+
+
+async def test_browser_level_endpoint_attaches_page_session(cdp_server, tmp_path):
+    """A browser-level URL gets an automatic Target.attachToTarget session and
+    every page-domain command carries the returned session id."""
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        # Reuses the non-blank TAB-1, same preference as launcher.get_page_ws_url.
+        assert cdp_server.attached == [
+            {"targetId": "TAB-1", "flatten": True, "sessionId": None}
+        ]
+        assert sess._internal.client.session_id == "SID-1"
+        enables = [m for m in cdp_server.received if m["method"] in _PAGE_ENABLES]
+        assert len(enables) == 3
+        assert all(m.get("sessionId") == "SID-1" for m in enables)
+
+        result = await sess.eval_js("1 + 1")
+        assert result.success is True
+        eval_msg = [
+            m for m in cdp_server.received if m["method"] == "Runtime.evaluate"
+        ][-1]
+        assert eval_msg.get("sessionId") == "SID-1"
+    finally:
+        await sess.close()
+
+
+async def test_browser_level_endpoint_creates_target_when_none_exists(
+    cdp_server, tmp_path
+):
+    """Zero page targets: connect creates an about:blank one and attaches."""
+    cdp_server.targets = []
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        assert cdp_server.attached[0]["targetId"] == "NEW-1"
+        assert cdp_server.targets[0]["url"] == "about:blank"
+    finally:
+        await sess.close()
+
+
+async def test_page_level_endpoint_skips_session_layer(cdp_server, tmp_path):
+    """Chrome's page-level URLs keep the original no-session behaviour."""
+    cdp_server.require_session = False
+    sess = await make_session(cdp_server.ws_url("/devtools/page/ABC"), tmp_path)
+    try:
+        assert cdp_server.attached == []
+        assert sess._internal.client.session_id is None
+        assert sess._internal.client.is_browser_level is False
+        enables = [m for m in cdp_server.received if m["method"] in _PAGE_ENABLES]
+        assert len(enables) == 3
+        assert all(m.get("sessionId") is None for m in enables)
+        result = await sess.eval_js("location.href")
+        assert result.success is True
+    finally:
+        await sess.close()
+
+
+async def test_switch_tab_reattaches_over_same_socket(cdp_server, tmp_path):
+    """Tab switching re-stamps the session id on the live socket — no
+    reconnect, no HTTP /json lookup."""
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        before = len(cdp_server.received)
+        result = await sess.switch_tab("TAB-9")
+        assert result.success is True
+        assert cdp_server.attached[-1] == {
+            "targetId": "TAB-9",
+            "flatten": True,
+            "sessionId": None,
+        }
+        assert sess._internal.client.session_id == "SID-2"
+        # Domains are per-session: re-enabled on the new session id.
+        new_enables = [
+            m for m in cdp_server.received[before:] if m["method"] in _PAGE_ENABLES
+        ]
+        assert len(new_enables) == 3
+        assert all(m.get("sessionId") == "SID-2" for m in new_enables)
+        # The socket survived: no second connection was dialed.
+        assert cdp_server.methods().count("Target.attachToTarget") == 2
+    finally:
+        await sess.close()
+
+
+async def test_viewport_applied_with_session_id(cdp_server, tmp_path):
+    """Emulation.setDeviceMetricsOverride reaches the page with the session id
+    and the configured dimensions."""
+    sess = await make_session(
+        cdp_server.ws_url(), tmp_path, viewport_width=1280, viewport_height=800
+    )
+    try:
+        assert cdp_server.viewport == {
+            "width": 1280,
+            "height": 800,
+            "deviceScaleFactor": 1,
+            "mobile": False,
+        }
+        viewport_msg = [
+            m
+            for m in cdp_server.received
+            if m["method"] == "Emulation.setDeviceMetricsOverride"
+        ][-1]
+        assert viewport_msg.get("sessionId") == "SID-1"
+    finally:
+        await sess.close()
+
+
+async def test_viewport_failure_warns_and_session_survives(
+    caplog, cdp_server, tmp_path
+):
+    """A rejected viewport override is logged, not swallowed, and does not
+    take the session down."""
+    cdp_server.fail_viewport = True
+    with caplog.at_level(logging.WARNING, logger="octop_browser.session"):
+        sess = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        assert sess._internal.client.session_id == "SID-1"
+        assert any(
+            "setDeviceMetricsOverride" in record.message for record in caplog.records
+        )
+        result = await sess.eval_js("1")
+        assert result.success is True
+    finally:
+        await sess.close()
+
+
+async def test_close_kill_leaves_remote_browser_running(
+    caplog, cdp_server, tmp_path, monkeypatch
+):
+    """kill=True in direct mode must not terminate the remote browser; it
+    says so instead of acting silently."""
+    terminated: list[Any] = []
+
+    async def fake_terminate(*args: Any, **kwargs: Any) -> bool:
+        terminated.append(True)
+        return True
+
+    monkeypatch.setattr("octop_browser.cdp.launcher.terminate_browser", fake_terminate)
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    with caplog.at_level(logging.INFO, logger="octop_browser.session"):
+        await sess.close(kill=True)
+    assert terminated == []
+    assert any("direct CDP mode" in record.message for record in caplog.records)
+
+
+async def test_list_tabs_uses_cdp_targets_in_direct_mode(cdp_server, tmp_path):
+    """list_tabs reads Target.getTargets instead of Chrome's HTTP /json."""
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        result = await sess.list_tabs()
+        assert result.success is True
+        tabs = result.metadata["tabs"]  # type: ignore[index]
+        assert [t["tab_id"] for t in tabs] == ["TAB-1", "TAB-9"]
+        assert tabs[0]["active"] is True
+        assert tabs[1]["active"] is False
+    finally:
+        await sess.close()
+
+
+async def test_new_tab_reuses_blank_target_via_cdp(cdp_server, tmp_path):
+    """A background about:blank target is found through CDP and reused — no
+    new target is created."""
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        result = await sess.new_tab("https://example.org/x")
+        assert result.success is True
+        assert result.content == "TAB-9"
+        assert result.metadata == {"target_id": "TAB-9"}
+        assert "Target.createTarget" not in cdp_server.methods()
+        assert cdp_server.attached[-1]["targetId"] == "TAB-9"
+        nav_msg = [m for m in cdp_server.received if m["method"] == "Page.navigate"][-1]
+        assert nav_msg["params"]["url"] == "https://example.org/x"
+        assert nav_msg.get("sessionId") == "SID-2"
+    finally:
+        await sess.close()
+
+
+async def test_new_tab_force_new_creates_and_attaches(cdp_server, tmp_path):
+    """force_new creates a target and attaches the session to it."""
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        result = await sess.new_tab("https://example.org/new", force_new=True)
+        assert result.success is True
+        assert result.metadata == {"target_id": "NEW-3"}
+        create_msg = [
+            m for m in cdp_server.received if m["method"] == "Target.createTarget"
+        ][-1]
+        assert create_msg["params"]["url"] == "https://example.org/new"
+        assert cdp_server.attached[-1]["targetId"] == "NEW-3"
+        assert sess._internal.client.session_id == "SID-2"
+    finally:
+        await sess.close()
+
+
+async def test_close_tab_removes_target(cdp_server, tmp_path):
+    """close_tab issues Target.closeTarget over the browser-level session."""
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        result = await sess.close_tab("TAB-9")
+        assert result.success is True
+        close_msg = [
+            m for m in cdp_server.received if m["method"] == "Target.closeTarget"
+        ][-1]
+        assert close_msg["params"]["targetId"] == "TAB-9"
+        assert [t["targetId"] for t in cdp_server.targets] == ["TAB-1"]
+    finally:
+        await sess.close()
