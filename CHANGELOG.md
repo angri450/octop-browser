@@ -14,6 +14,15 @@
 
 ### 变更
 
+- 直连 CDP 模式续修（第二批）：connect 后把 attach 的 target id 写入 profile，
+  修复 `_current_target_id()` 恒空导致 `list_tabs` active 标记失效与跨进程粘性
+  缺失；recorder 直连模式的标签页发现/轮询改走 CDP `Target.getTargets`（替代
+  Chrome 专有的 HTTP `/json`），新开标签页可被发现并单独 attach；
+  `CDPClient.connect` 支持指定 `target_id` 并暴露 `current_target_id`；`new_tab`
+  对 `TargetAlreadyLoaded` 规范化——Chrome 对重复 URL 返回既有 targetId、
+  Lightpanda（单标签）对第二次 createTarget 一律报错，现统一回退为复用同 URL
+  既有 target；`browser_tool` 的 `close_session(kill=True)` 直连模式记录日志。
+  README 补充单标签/单会话服务器（Lightpanda）的能力边界。
 - 修复直连 CDP 模式（`BROWSER_USE_CDP_WS_URL`）：browser 级端点现在会在连接时
   自动 `Target.attachToTarget` 建立页面会话，页面域命令携带 sessionId；此前直连
   标准 CDP 服务器（如 Lightpanda）会在 `Runtime.enable` 阶段报
