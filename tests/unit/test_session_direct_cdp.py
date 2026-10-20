@@ -18,6 +18,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from pathlib import Path
 from typing import Any
 
 import pytest
@@ -104,6 +105,10 @@ class FakeCDPServer:
             )
             await self._reply(ws, msg_id, {"targetId": target_id})
         elif method == "Target.attachToTarget":
+            requested = params.get("targetId")
+            if not any(t.get("targetId") == requested for t in self.targets):
+                await self._error(ws, msg_id, "No target with given id")
+                return
             self.attached.append(
                 {
                     "targetId": params.get("targetId"),
@@ -558,3 +563,86 @@ async def test_new_tab_already_loaded_tolerates_trailing_slash(cdp_server, tmp_p
         assert result.content == "TAB-1"
     finally:
         await sess.close()
+
+
+# ----------------------------------------------------------------------
+# Fourth batch: CLI entry point, sticky target, lost-page warning
+# ----------------------------------------------------------------------
+
+
+async def test_connect_prefers_remembered_target(cdp_server, tmp_path):
+    """A second session on the same profile re-attaches to the target the
+    first one left behind, even when another non-blank page exists."""
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    await sess.close()
+    # A second page appeared while we were disconnected.
+    cdp_server.targets.append(
+        {
+            "targetId": "TAB-2",
+            "type": "page",
+            "url": "https://other.example",
+            "title": "Other",
+        }
+    )
+    sess2 = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        assert cdp_server.attached[-1]["targetId"] == "TAB-1"
+        assert sess2._internal.client.current_target_id == "TAB-1"
+    finally:
+        await sess2.close()
+
+
+async def test_connect_warns_when_remote_page_lost(caplog, cdp_server, tmp_path):
+    """Lightpanda recycles target ids, so an unchanged id does not prove the
+    page survived — a URL mismatch must warn (once)."""
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    await sess.navigate("https://example.com")
+    await sess.close()
+    # Same id, fresh page — the browser dropped the old target.
+    cdp_server.targets[0]["url"] = "about:blank"
+    with caplog.at_level(logging.WARNING, logger="octop_browser.session"):
+        sess2 = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        assert any("lost the previous page" in r.message for r in caplog.records)
+        assert any("https://example.com" in r.message for r in caplog.records)
+    finally:
+        await sess2.close()
+
+
+async def test_connect_falls_back_when_remembered_target_gone(cdp_server, tmp_path):
+    """The remembered target died; connect attaches to an available page
+    instead of failing."""
+    sess = await make_session(cdp_server.ws_url(), tmp_path)
+    await sess.close()
+    cdp_server.targets = [
+        {
+            "targetId": "TAB-7",
+            "type": "page",
+            "url": "https://fresh.example",
+            "title": "Fresh",
+        }
+    ]
+    sess2 = await make_session(cdp_server.ws_url(), tmp_path)
+    try:
+        assert cdp_server.attached[-1]["targetId"] == "TAB-7"
+        assert sess2._internal.client.current_target_id == "TAB-7"
+    finally:
+        await sess2.close()
+
+
+def test_python_dash_m_entry_point_exists():
+    """``python -m octop_browser`` is documented in the README and wired into
+    ``make run``; the package must expose __main__."""
+    import subprocess
+    import sys
+
+    root = Path(__file__).resolve().parents[2]
+    result = subprocess.run(
+        [sys.executable, "-m", "octop_browser", "--help"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        cwd=str(root),
+    )
+    assert result.returncode == 0
+    assert "octop-browser CLI" in result.stdout

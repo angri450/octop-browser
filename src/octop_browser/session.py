@@ -66,7 +66,14 @@ class _InternalCDPSession:
             ws_url = await get_page_ws_url(
                 self._profile.cdp_port, profile=self._profile
             )
-        await self._client.connect(ws_url)
+        # Direct mode: prefer the tab the previous session left behind, like
+        # launcher.get_page_ws_url's sticky target. Falls back automatically
+        # when that target no longer exists.
+        remembered_id, remembered_url = self._profile.load_target_state()
+        await self._client.connect(
+            ws_url,
+            target_id=remembered_id if self._cfg.cdp_ws_url else None,
+        )
         await self._enable_page_domains()
         # Note: the "Input" domain has no .enable method in CDP — input events
         # are dispatched directly via Input.dispatch* commands without enabling.
@@ -76,11 +83,43 @@ class _InternalCDPSession:
         # already saves it inside get_page_ws_url; direct CDP mode had no
         # equivalent, leaving _current_target_id() (and therefore list_tabs'
         # active marker) empty for the whole session.
-        if self._client.current_target_id:
-            self._profile.save_target(self._client.current_target_id)
+        attached_target_id = self._client.current_target_id
+        if attached_target_id:
+            attached_url = self._client.current_target_url
+            if remembered_id and remembered_id != attached_target_id:
+                logger.warning(
+                    "Remote browser did not keep tab %s; attached to %s instead.",
+                    remembered_id,
+                    attached_target_id,
+                )
+            elif (
+                remembered_url
+                and remembered_url != "about:blank"
+                and attached_url != remembered_url
+            ):
+                # Some servers (Lightpanda) recycle target ids, so an
+                # unchanged id does not prove the page survived — compare
+                # the URL the previous session left behind as well.
+                logger.warning(
+                    "Remote browser lost the previous page (was %s, now %s). "
+                    "Browsers that drop targets when the last connection "
+                    "closes (e.g. Lightpanda) cannot preserve page state "
+                    "across CLI invocations — each command starts from a "
+                    "fresh page.",
+                    remembered_url,
+                    attached_url or "about:blank",
+                )
+            self._profile.save_target(attached_target_id, attached_url)
         self._connected = True
         if self._idle_controller is not None:
             self._idle_controller.start()
+
+    def remember_current_target(self, url: str | None = None) -> None:
+        """Persist the active target (and current page url) for the next
+        process to re-attach to."""
+        target_id = self._client.current_target_id
+        if target_id:
+            self._profile.save_target(target_id, url)
 
     async def _enable_page_domains(self) -> None:
         """Enable the page domains every action depends on.
@@ -309,6 +348,8 @@ class BrowserSession(HooksMixin):
         result = await nav_actions.navigate(
             self._internal.client, self._internal.ref_cache, url
         )
+        if result.success:
+            self._internal.remember_current_target(url)
         await self._record(result)
         return result
 
