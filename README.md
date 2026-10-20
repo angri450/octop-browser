@@ -393,6 +393,9 @@ Both shapes support the full action set. Known limitations of direct mode:
   when the last connection closes: every command starts from a fresh page.
   octop-browser logs a warning when it detects the loss; prefer the Python
   API (one long-lived session) for such browsers.
+- Replay works in direct mode (it drives actions through the same session
+  API); recording against single-session servers captures no events, since
+  page events only reach the connection that issued the command.
 
 ## 🛠️ Development
 

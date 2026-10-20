@@ -381,6 +381,8 @@ session = await BrowserSession.create(profile="remote", settings=settings)
 - CLI 模式（每条命令一个进程）面对「连接断开即回收标签」的服务器：每条命令
   都从空白页开始，检测到丢失时 octop-browser 会记录警告；此类浏览器建议
   改用 Python API 维持长会话。
+- 回放（replay）在直连模式下可用（与动作走同一会话 API）；但在单会话服务器上
+  录制（record）capture 不到任何事件——页面事件只送达发出命令的连接。
 
 ## 🛠️ 开发
 
