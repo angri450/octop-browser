@@ -73,6 +73,7 @@ class CDPClient:
         self._id = 0
         self._session_id: str | None = None
         self._current_target_id: str | None = None
+        self._current_target_url: str | None = None
         self._browser_level = False
 
     @property
@@ -89,6 +90,11 @@ class CDPClient:
     def current_target_id(self) -> str | None:
         """Target id of the attached page session, if any."""
         return self._current_target_id
+
+    @property
+    def current_target_url(self) -> str | None:
+        """URL of the attached page target as last reported by the browser."""
+        return self._current_target_url
 
     async def connect(self, ws_url: str, target_id: str | None = None) -> None:
         """Connect to a CDP WebSocket endpoint.
@@ -110,9 +116,10 @@ class CDPClient:
         Args:
             ws_url: Endpoint to dial.
             target_id: Browser-level endpoints only — attach to this page
-                target instead of picking/creating one. Callers that manage
-                several pages over one socket (the recorder) pass it
-                explicitly.
+                target instead of picking/creating one. When the preferred
+                target no longer exists, connect falls back to automatic
+                selection instead of failing. Callers that manage several
+                pages over one socket (the recorder) pass it explicitly.
         """
         ws = await websockets.connect(
             ws_url,
@@ -127,7 +134,18 @@ class CDPClient:
             return
         self._browser_level = True
         try:
-            await self.attach_page_session(target_id)
+            try:
+                await self.attach_page_session(target_id)
+            except CDPSessionError:
+                if target_id is None:
+                    raise
+                # The remembered target died between sessions; attach to
+                # whatever page the browser still has instead of failing.
+                logger.debug(
+                    "Preferred target %s is gone; attaching to an available page",
+                    target_id,
+                )
+                await self.attach_page_session()
         except CDPSessionError as exc:
             await self.close()
             raise CDPSessionError(
@@ -147,8 +165,14 @@ class CDPClient:
         """
         if self._ws is None:
             raise CDPSessionError("Not connected")
+        url: str | None = None
         if target_id is None:
-            target_id = await self._pick_page_target()
+            target_id, url = await self._pick_page_target()
+        else:
+            pages = await self._page_targets()
+            match = next((t for t in pages if t.get("targetId") == target_id), None)
+            if match is not None:
+                url = match.get("url") or None
         result = await self._send_command(
             "Target.attachToTarget",
             {"targetId": target_id, "flatten": True},
@@ -161,22 +185,26 @@ class CDPClient:
             )
         self._session_id = session_id
         self._current_target_id = target_id
+        self._current_target_url = url
         return session_id
 
-    async def _pick_page_target(self) -> str:
-        """Return a usable page target id, creating one when none exists.
+    async def _page_targets(self) -> list[dict[str, Any]]:
+        """Return the browser's current page target infos."""
+        result = await self._send_command("Target.getTargets", session_id=None)
+        return [t for t in result.get("targetInfos", []) if t.get("type") == "page"]
+
+    async def _pick_page_target(self) -> tuple[str, str | None]:
+        """Return ``(target_id, url)`` of a usable page target.
 
         Preference order mirrors ``launcher.get_page_ws_url``: a non-blank
         page first, then any page, then a freshly created ``about:blank``.
         """
-        result = await self._send_command("Target.getTargets", session_id=None)
-        infos: list[dict[str, Any]] = list(result.get("targetInfos", []))
-        pages = [t for t in infos if t.get("type") == "page"]
+        pages = await self._page_targets()
         non_blank = [t for t in pages if t.get("url") and t.get("url") != "about:blank"]
         for candidate in [*non_blank, *pages]:
             target_id = candidate.get("targetId")
             if isinstance(target_id, str) and target_id:
-                return target_id
+                return target_id, (candidate.get("url") or None)
         created = await self._send_command(
             "Target.createTarget", {"url": "about:blank"}, session_id=None
         )
@@ -185,7 +213,7 @@ class CDPClient:
             raise CDPSessionError(
                 "No page target available and Target.createTarget returned none"
             )
-        return target_id
+        return target_id, "about:blank"
 
     async def send(
         self,
@@ -287,6 +315,7 @@ class CDPClient:
                 pass
         self._session_id = None
         self._current_target_id = None
+        self._current_target_url = None
         self._browser_level = False
         logger.debug("CDP connection closed")
 
