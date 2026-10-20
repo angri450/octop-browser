@@ -389,6 +389,10 @@ Both shapes support the full action set. Known limitations of direct mode:
   stickiness does not apply; and because page events reach only the
   connection that issued the command, the recorder cannot observe actions
   driven from a second connection against such a server.
+- CLI mode (one process per command) against servers that recycle targets
+  when the last connection closes: every command starts from a fresh page.
+  octop-browser logs a warning when it detects the loss; prefer the Python
+  API (one long-lived session) for such browsers.
 
 ## 🛠️ Development
 

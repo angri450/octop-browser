@@ -378,6 +378,9 @@ session = await BrowserSession.create(profile="remote", settings=settings)
   标签，不同 URL 时失败；全部连接断开后标签即回收，跨进程的标签粘性不适用；
   页面事件只推送给发出命令的连接，因此 recorder 无法通过第二个连接观测
   这类服务器上的操作。
+- CLI 模式（每条命令一个进程）面对「连接断开即回收标签」的服务器：每条命令
+  都从空白页开始，检测到丢失时 octop-browser 会记录警告；此类浏览器建议
+  改用 Python API 维持长会话。
 
 ## 🛠️ 开发
 
