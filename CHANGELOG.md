@@ -14,6 +14,12 @@
 
 ### 变更
 
+- CLI 直连冒烟续修：补 `__main__.py` 修复 `python -m octop_browser`
+  （README 与 `make run` 均如此记载但此前不可用）；connect 优先 attach
+  profile 记住的 target（与 launcher sticky 语义一致），不存在时自动回退；
+  profile 状态文件新增 url 字段并在 navigate 后刷新，attach 后比对 URL，
+  远程浏览器丢失页面时 warning 明确告警（Lightpanda 复用回收后的 target
+  id，仅靠 id 无法发现）。README 补充 CLI 模式对「回收型」服务器的边界。
 - 直连 CDP 模式续修（第二批）：connect 后把 attach 的 target id 写入 profile，
   修复 `_current_target_id()` 恒空导致 `list_tabs` active 标记失效与跨进程粘性
   缺失；recorder 直连模式的标签页发现/轮询改走 CDP `Target.getTargets`（替代
